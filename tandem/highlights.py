@@ -166,10 +166,14 @@ def flow_rotation_deg(dx_px: list[float], fps: float, width_px: int, hfov_deg: f
     return [abs(cum[i + n] - cum[i]) for i in range(len(cum) - n)] if len(cum) > n else []
 
 
-def from_signals(lo: float, hi: float, ts: list[float], frac: list[float], sig=None) -> list[Highlight]:
+def from_signals(lo: float, hi: float, ts: list[float], frac: list[float], sig=None,
+                 rotations: list[dict] | None = None) -> list[Highlight]:
     """Highlights of the free fall [lo, hi] (drogue throw -> deploy) from per-second pair
     fractions ``(ts, frac)`` and, when given, the camera telemetry ``sig`` (gyroscope for
-    orbits, GoPro smile score for ranking face moments)."""
+    orbits, GoPro smile score for ranking face moments). ``rotations`` — segments from
+    tandem.rotation.detect (orbit, pair spin or carousel, one class) — replace the
+    gyro-only orbit rule when given: on 170 labelled windows the trained detector is
+    92 % precise at 78 % recall vs 84 % / 79 % for the gyro alone."""
     smile = None
     if sig is not None and getattr(sig, "smile", None) and len(sig.smile) == len(sig.t_s):
         st, sv = sig.t_s, sig.smile
@@ -178,7 +182,12 @@ def from_signals(lo: float, hi: float, ts: list[float], frac: list[float], sig=N
             vals = [v for tt, v in zip(st, sv) if abs(tt - t) <= 0.5]
             smile.append(max(vals) if vals else 0.0)
     cands = scale_moments(list(ts), list(frac), lo, hi, smile)
-    if sig is not None and getattr(sig, "gx", None) and len(sig.gx) == len(sig.t_s):
+    if rotations is not None:
+        for r in rotations:
+            if r["start_s"] >= lo and r["end_s"] <= hi:
+                c0, c1 = _clip(r["start_s"], r["end_s"], ORBIT_WINDOW_S, lo, hi)
+                cands.append(Highlight("orbit", round(c0, 2), round(c1, 2), round(r["score"], 3), "rotation"))
+    elif sig is not None and getattr(sig, "gx", None) and len(sig.gx) == len(sig.t_s):
         def seen(a, b):
             v = [f for t, f in zip(ts, frac) if a <= t <= b]
             return sum(f >= PAIR_SEEN for f in v) / len(v) if v else 0.0
