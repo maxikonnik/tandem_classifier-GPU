@@ -29,6 +29,19 @@ def gpu_decode_available() -> bool:
         return False
 
 
+@functools.lru_cache(maxsize=1)
+def nvenc_available() -> bool:
+    """True when ffmpeg can actually open h264_nvenc here — listed encoders are not
+    enough: this ffmpeg build needs NVENC API 13.1 (driver >= 610), the installed
+    driver offers 13.0, so the encoder fails to open. Checked once by encoding a frame."""
+    try:
+        r = subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "color=c=black:s=256x256:d=0.1",
+                            "-c:v", "h264_nvenc", "-f", "null", "-"], capture_output=True, timeout=60)
+        return r.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
 def keyframe_times(path: str, lo: float, hi: float) -> list[float]:
     """Presentation times of the video keyframes in [lo, hi) — from the packet index,
     no decoding."""
