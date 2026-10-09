@@ -8,11 +8,13 @@ rotation detector's segments (tandem.rotation) and the camera gyroscope. ``plan`
 ffmpeg; ``face_options`` lists every usable passenger-face clip to choose from.
 
 Kinds:
-  exit     [exit - 1, exit + 3]
-  wide     pair visible but <= 10 % of the frame, >= 3 s                      (3 s clip)
+  exit     [exit - 1, drogue throw + 0.5] (without a drogue: [exit - 1, exit + 3])
+  wide     the most general shots: the 3 s windows where the visible pair is smallest
+           (pair seen in >= 80 % of the frames); two are always asked for     (3 s clip)
   medium   pair >= 10 % of the frame (medium and close shots), >= 2.5 s     (3 s clip)
   face     passenger face >= FACE_H of the frame height, >= 1.5 s; ranked by emotion =
            max(smile, jawOpen) at the peak                                    (2.5 s clip)
+           — or exactly the face clips a person picked (``faces``)
   rotation the trained rotation detector (tandem.rotation): an orbit, the pair spinning
            or pair + operator turning together — one class                    (6 s clip)
   Without detector segments the older rules stand in:
@@ -22,6 +24,8 @@ Kinds:
            camera; a growing pair is the operator closing in, not a turn       (4 s)
   freefall filler: plain free-fall pieces when the candidates cannot fill the time
   deploy   [deploy - 1.5, deploy + 2.5]
+The middle (drogue -> deploy) runs in time order, or shuffled with ``order="random"``
+(a fixed seed per jump); source times never overlap either way.
 """
 from __future__ import annotations
 
@@ -33,6 +37,8 @@ from tandem.highlights import net_rotation_deg, ORBIT_MIN_DEG, ORBIT_WINDOW_S
 
 EDIT_S = 30.0
 EXIT_PRE, EXIT_POST = 1.0, 3.0
+EXIT_AFTER_DROGUE = 0.5  # the exit clip runs through the drogue throw and ends this much after it
+WIDEST_SEEN = 0.8        # a "most general" window needs the pair in >= 80 % of its frames
 DEPLOY_PRE, DEPLOY_POST = 1.5, 2.5
 PAIR_SEEN, WIDE_MAX, MEDIUM_MAX = 0.02, 0.10, 1.01   # medium: 10 %+ (close-ups too)
 FACE_H = 0.06            # passenger face height >= 6 % of the frame height
@@ -42,7 +48,9 @@ SPIN_DRIFT_MIN = 0.35    # 1 - min cosine of pair-crop embeddings to the window'
 SPIN_SIZE_RATIO = 1.4    # pair size: last third vs first third of the window (else an approach)
 CLIP = {"wide": 3.0, "medium": 3.0, "face": 2.5, "rotation": 6.0, "orbit": 6.0, "spin": 4.0}
 # What the middle of the edit asks for, in priority order: (kind, how many).
-WANT = (("rotation", 1), ("orbit", 1), ("face", 2), ("spin", 1), ("medium", 2), ("wide", 2),
+# Picked faces first (a person chose them), then rotation (rare — a jump has one or two),
+# then the two most general shots (many alternatives: the next widest window steps in).
+WANT = (("face", 9), ("rotation", 1), ("wide", 2), ("orbit", 1), ("spin", 1), ("medium", 2),
         ("medium", 2), ("wide", 2))
 GAP = 0.5
 MIN_CLIP = 2.0
@@ -82,8 +90,30 @@ def _centered(c: float, length: float, lo: float, hi: float) -> tuple[float, flo
     return a, min(hi, a + length)
 
 
+def _widest(fr: list[dict], dt: float, n: int = 40) -> list[Cut]:
+    """The most general shots, best first: CLIP["wide"] windows (starts >= 1 s apart)
+    ranked by how small the visible pair is on average (pair seen in >= WIDEST_SEEN of
+    the frames). Many overlapping alternatives on purpose — when the widest ones sit
+    under a picked face or a rotation, the planner takes the next widest free window."""
+    k = max(2, int(round(CLIP["wide"] / dt)))
+    wins = []
+    for i in range(len(fr) - k + 1):
+        seg = fr[i:i + k]
+        vis = [f["frac"] for f in seg if f["frac"] >= PAIR_SEEN]
+        if len(vis) >= WIDEST_SEEN * k:
+            wins.append((sum(vis) / len(vis), seg[0]["t"], seg[-1]["t"] + dt))
+    out: list[Cut] = []
+    for m, a, b in sorted(wins):
+        if all(abs(a - c.start_s) >= 1.0 for c in out):
+            out.append(Cut("wide", round(a, 2), round(b, 2), round(1 - m, 4)))
+        if len(out) == n:
+            break
+    return out
+
+
 def candidates(frames: list[dict], lo: float, hi: float, gyro: dict | None = None,
-               emb=None, rotations: list[dict] | None = None) -> list[Cut]:
+               emb=None, rotations: list[dict] | None = None,
+               faces: list[tuple[float, float]] | None = None) -> list[Cut]:
     """All candidate clips of the free fall [lo, hi] (drogue -> deploy - 1.5).
     ``rotations`` (segments from tandem.rotation.detect) replace the gyro orbit and
     spin rules when given."""
@@ -107,11 +137,17 @@ def candidates(frames: list[dict], lo: float, hi: float, gyro: dict | None = Non
                 c0, c1 = _centered(mid, L, s0, s1)
                 out.append(Cut(kind, round(c0, 2), round(c1, 2), round(base * 0.8 ** k, 3)))
 
-    scale_runs("wide", lambda f: PAIR_SEEN <= f["frac"] <= WIDE_MAX, 3.0, lambda seg, d: d)
+    out += _widest(fr, dt)
     scale_runs("medium", lambda f: WIDE_MAX < f["frac"] < MEDIUM_MAX, 2.5,
                lambda seg, d: d * sum(f["frac"] for f in seg) / len(seg))
+    if faces is not None:          # the face clips a person picked, nothing automatic
+        for a, b in faces:
+            a, b = max(lo, a), min(hi, b)
+            if b - a >= MIN_CLIP / 2:
+                out.append(Cut("face", round(a, 2), round(b, 2), 1.0))
     # passenger face: clip centred on the most emotional frame of each run
-    for a, b in _runs([bool(f.get("passenger")) and f["passenger"]["h"] >= FACE_H for f in fr]):
+    for a, b in ([] if faces is not None else
+                 _runs([bool(f.get("passenger")) and f["passenger"]["h"] >= FACE_H for f in fr])):
         if (b - a) * dt < 1.5:
             continue
         seg = fr[a:b]
@@ -127,8 +163,12 @@ def candidates(frames: list[dict], lo: float, hi: float, gyro: dict | None = Non
         for r in rotations:
             s0, s1 = max(lo, r["start_s"]), min(hi, r["end_s"])
             if s1 - s0 >= MIN_CLIP:
-                c0, c1 = _centered((s0 + s1) / 2, CLIP["rotation"], s0, s1)
-                out.append(Cut("rotation", round(c0, 2), round(c1, 2), round(r["score"], 3)))
+                L = CLIP["rotation"]           # centred, then flush left / right: room around other clips
+                for k, mid in enumerate(((s0 + s1) / 2, s0 + L / 2, s1 - L / 2)):
+                    c0, c1 = _centered(mid, L, s0, s1)
+                    c = Cut("rotation", round(c0, 2), round(c1, 2), round(r["score"] * (1 - 0.01 * k), 3))
+                    if all(abs(c.start_s - o.start_s) > 0.05 for o in out if o.kind == "rotation"):
+                        out.append(c)
         return out
     # orbit (gyro) and spin (pair turns while the camera holds)
     rot_at = None
@@ -185,14 +225,20 @@ def candidates(frames: list[dict], lo: float, hi: float, gyro: dict | None = Non
 
 def plan(exit_s: float | None, drogue_s: float | None, deploy_s: float, frames: list[dict],
          gyro: dict | None = None, emb=None, length: float = EDIT_S,
-         rotations: list[dict] | None = None) -> list[Cut]:
+         rotations: list[dict] | None = None, faces: list[tuple[float, float]] | None = None,
+         order: str = "time", seed: int | str | None = None) -> list[Cut]:
     """The edit: exit clip, middle clips by WANT priority, deploy clip; ``length`` seconds
     in total, in time order, no overlaps."""
-    head = Cut("exit", round(max(0.0, exit_s - EXIT_PRE), 2), round(exit_s + EXIT_POST, 2)) if exit_s is not None else None
+    if exit_s is None:
+        head = None
+    elif drogue_s is not None and drogue_s + EXIT_AFTER_DROGUE > exit_s + MIN_CLIP / 2:
+        head = Cut("exit", round(max(0.0, exit_s - EXIT_PRE), 2), round(drogue_s + EXIT_AFTER_DROGUE, 2))
+    else:
+        head = Cut("exit", round(max(0.0, exit_s - EXIT_PRE), 2), round(exit_s + EXIT_POST, 2))
     tail = Cut("deploy", round(deploy_s - DEPLOY_PRE, 2), round(deploy_s + DEPLOY_POST, 2))
     lo = max(head.end_s if head else 0.0, drogue_s if drogue_s is not None else 0.0) + GAP
     hi = tail.start_s - GAP
-    pool = candidates(frames, lo, hi, gyro, emb, rotations)
+    pool = candidates(frames, lo, hi, gyro, emb, rotations, faces)
     budget = length - tail.dur - (head.dur if head else 0.0)
     chosen: list[Cut] = []
     free = lambda c: all(c.end_s + GAP <= o.start_s or o.end_s + GAP <= c.start_s for o in chosen)
@@ -257,7 +303,11 @@ def plan(exit_s: float | None, drogue_s: float | None, deploy_s: float, frames: 
         tail = Cut("deploy", tail.start_s, round(tail.end_s + extra, 2)); short = round(short - extra, 2)
         if short > 0 and head:
             head = Cut("exit", round(max(0.0, head.start_s - min(short, EXIT_EXTRA_MAX)), 2), head.end_s)
-    return ([head] if head else []) + sorted(chosen, key=lambda c: c.start_s) + [tail]
+    middle = sorted(chosen, key=lambda c: c.start_s)
+    if order == "random":
+        import random
+        random.Random(seed if seed is not None else round(deploy_s, 1)).shuffle(middle)
+    return ([head] if head else []) + middle + [tail]
 
 
 def face_options(frames: list[dict], lo: float, hi: float, top: int = 6) -> list[Cut]:
